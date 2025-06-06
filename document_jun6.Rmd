@@ -1,0 +1,564 @@
+---
+title: "Document"
+author: "Sijia Wang"
+date: "2025-05-22"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document: default
+---
+
+```{r setup, message=FALSE}
+library(conflicted)
+conflict_prefer("map", "pomp")
+conflict_prefer("filter", "dplyr")
+
+library(pomp)
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## POMP Model Fitting
+
+We now use the **orange panel data between days 41 and 107** to build and analyze a Partially Observed Markov Process (POMP) model.
+
+```{r Data}
+X123=read.csv("NoEvoData=SE=Feb14 2012.csv"); 
+orange_data <- data.frame(
+  day = X123$day,
+  algae = X123$Algae.orange1,
+  flagellates = X123$Flag.orange1,
+  rotifers = X123$Rot.orange1
+)
+
+orange_data <- orange_data[orange_data$day >= 41 & orange_data$day <= 107, ]
+rownames(orange_data) <- NULL
+
+summary(orange_data)
+```
+
+
+```{r Plot}
+xrange <- range(orange_data$day)
+yrange <- range(
+  orange_data$algae,
+  orange_data$flagellates,
+  orange_data$rotifers,
+  na.rm = TRUE
+)
+
+max_algae <- max(orange_data$algae, na.rm = TRUE)
+max_flag <- max(orange_data$flagellates, na.rm = TRUE)
+max_roti <- max(orange_data$rotifers, na.rm = TRUE)
+
+orange_rel <- orange_data
+orange_rel[, 2:4] <- scale(orange_data[, 2:4], center = FALSE,
+                           scale = c(max_algae, max_flag, max_roti))
+
+orange_rel_long <- orange_rel %>%
+  pivot_longer(cols = c(algae, flagellates, rotifers),
+               names_to = "species",
+               values_to = "rel_abundance")
+
+ggplot(orange_rel_long, aes(x = day, y = rel_abundance, color = species)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2, aes(shape = species)) +
+  scale_color_manual(values = c(
+    algae = "green4",
+    flagellates = "purple",
+    rotifers = "red"
+  )) +
+  scale_shape_manual(values = c(
+    algae = 16, flagellates = 17, rotifers = 15
+  )) +
+  labs(
+    title = "Standardized Population Dynamics of Orange Panel",
+    x = "Day", y = "Relative Abundance",
+    color = "Species", shape = "Species"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+```
+
+
+```{r Name}
+statenames <- c("S", # limiting substrate
+                "A", # algae 
+                "R", # rotifers
+                "F") # flagellates
+
+maxA <- max(orange_data$algae, na.rm = TRUE)
+maxF <- max(orange_data$flagellates, na.rm = TRUE)
+maxR <- max(orange_data$rotifers, na.rm = TRUE)
+
+
+# all parameters are positive
+paramnames <- c(
+  "delta", # dilution rate
+  "kA", # half-saturation constant
+  "kR", # half-saturation constant
+  "r", 
+  "g", 
+  "h",
+  "alphaA", # handing-time parameter
+  "alphaF", # handing-time parameter
+  "eta", # maximum per capitarate parameter for flagellates grazing on algae
+  "IF",
+  "S_0", 
+  "A_0", 
+  "R_0", 
+  "F_0",
+  "maxA",
+  "maxF",
+  "maxR"
+)
+
+```
+
+
+```{r process_model}
+rproc <- euler(
+  step.fun = Csnippet("
+    double dS = delta * (1 - S) - S * r * A / (kA + S);
+    double dA = A * (
+      r * S / (kA + S)
+      - g * R / (kR + A + alphaF * F)
+      - h * F / (1 + alphaA * A)
+      - delta
+    );
+    double dR = R * (
+      g * A / (kR + A + alphaF * F)
+      + eta * F / (kR + A + alphaF * F)
+      - delta
+    );
+    double dF = F * (
+      h * A / (1 + alphaA * A)
+      - eta * R / (kR + A + alphaF * F)
+      - delta
+    ) + IF;
+
+    S += dS * dt;
+    A += dA * dt;
+    R += dR * dt;
+    F += dF * dt;
+    
+    if (A < 0) A = 1e-6;
+    if (F < 0) F = 1e-6;
+    if (R < 0) R = 1e-6;
+    if (S < 0) S = 1e-6;
+    
+    if (A > 1e3) A = 1e3;
+    if (F > 1e3) F = 1e3;
+    if (R > 1e3) R = 1e3;
+
+  "),
+  delta.t = 0.3
+)
+
+```
+
+
+```{r measurement_model}
+rmeasure <- Csnippet("
+  algae = rnorm(A / maxA, 0.1);
+  flagellates = rnorm(F / maxF, 0.1);
+  rotifers = rnorm(R / maxR, 0.1);
+")
+
+dmeasure <- Csnippet("
+  lik = dnorm(algae, A / maxA, 0.1, 1) +
+        dnorm(flagellates, F / maxF, 0.1, 1) +
+        dnorm(rotifers, R / maxR, 0.1, 1);
+  if (!give_log) lik = exp(lik);
+")
+
+```
+
+
+```{r init_state}
+rinit <- Csnippet("
+  S = S_0;
+  A = A_0;
+  R = R_0;
+  F = F_0;
+")
+
+```
+
+```{r pomp_setup}
+pt <- parameter_trans(
+  log   = c(
+  "delta", # dilution rate
+  "kA", # half-saturation constant
+  "kR", # half-saturation constant
+  "r", 
+  "g", 
+  "h",
+  "alphaA", # handing-time parameter
+  "alphaF", # handing-time parameter
+  "eta", # maximum per capitarate parameter for flagellates grazing on algae
+  "IF",
+  "S_0", 
+  "A_0", 
+  "R_0", 
+  "F_0",
+  "maxA",
+  "maxF",
+  "maxR")
+)
+
+pomp_model <- pomp(
+  data = orange_rel,
+  times = "day",
+  t0 = 40,
+  rprocess = rproc,
+  rmeasure = rmeasure,
+  dmeasure = dmeasure,
+  rinit = rinit,
+  statenames = statenames,
+  paramnames = paramnames,
+  obsnames = c("algae", "flagellates", "rotifers"),
+  partrans   = pt
+)
+
+init_row <- X123[X123$day == 40, ]
+
+params <- c(
+  delta = 0.15,
+  kA = 0.25,
+  kR = 0.59,
+  r = 0.5,
+  g = 0.3,
+  h = 2,
+  alphaA = 0.3,
+  alphaF = 1,
+  eta = 2.5,
+  IF = 0.002,
+  S_0 = 80,
+  A_0 = init_row$Algae.orange1 / max(orange_data$algae, na.rm = TRUE),
+  R_0 = init_row$Rot.orange1 / max(orange_data$rotifers, na.rm = TRUE),
+  F_0 = init_row$Flag.orange1 / max(orange_data$flagellates, na.rm = TRUE),
+  maxA = max(orange_data$algae, na.rm = TRUE),
+  maxR =  max(orange_data$rotifers, na.rm = TRUE),
+  maxF = max(orange_data$flagellates, na.rm = TRUE)
+)
+
+sim <- simulate(pomp_model, params = params, nsim = 1)
+sim_df <- as.data.frame(sim, include.data = FALSE)
+
+orange_obs_long <- orange_rel %>%
+  pivot_longer(cols = c(algae, flagellates, rotifers),
+               names_to = "species",
+               values_to = "obs")
+
+sim_long <- sim_df %>%
+  mutate(time = day) %>%
+  pivot_longer(cols = c(A, R, F),
+               names_to = "species",
+               values_to = "sim") %>%
+  mutate(species = recode(species,
+                          A = "algae",
+                          R = "rotifers",
+                          F = "flagellates"))
+
+plot_data <- left_join(sim_long, orange_obs_long, by = c("time" = "day", "species"))
+
+ggplot(plot_data, aes(x = time)) +
+  geom_line(aes(y = sim, color = species), linewidth = 1) +
+  geom_point(aes(y = obs, color = species, shape = species), size = 2) +
+  scale_color_manual(values = c(
+    algae = "green4",
+    flagellates = "purple",
+    rotifers = "red"
+  )) +
+  scale_shape_manual(values = c(
+    algae = 16, flagellates = 17, rotifers = 15
+  )) +
+  labs(
+    title = "POMP Simulation vs. Observed Data (Relative Abundance)",
+    y = "Relative Abundance",
+    x = "Day", color = "Species", shape = "Species"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+
+pf_result <- pfilter(pomp_model, params = params, Np = 1000)
+logLik(pf_result)
+```
+
+
+```{r local_search, message=FALSE}
+library(doFuture)
+library(doRNG)
+library(foreach)
+plan(multisession)
+registerDoFuture()
+
+rw_sd_values <- rw_sd(
+  delta    = 0.02,
+  kA       = 0.02,
+  kR       = 0.02,
+  r        = 0.02,
+  g        = 0.02,
+  h        = 0.02,
+  alphaA   = 0.02,
+  alphaF   = 0.02,
+  eta      = 0.02,
+  IF       = 0.02
+)
+
+mifs_local <- foreach(i = 1:20, .combine = c) %dorng% {
+  bake(file = tempfile(), {
+    mif2(
+      pomp_model,
+      params = params,
+      Np = 500,
+      Nmif = 300,
+      cooling.fraction.50 = 0.5,
+      rw.sd = rw_sd_values
+    )
+  })
+}
+
+mifs_local |>
+  traces() |>
+  melt() |>
+  filter(name != "loglik" | (value > -1e3)) |>
+  ggplot(aes(x = iteration, y = value, group = .L1, color = factor(.L1))) +
+  geom_line() +
+  facet_wrap(~ name, scales = "free_y") +
+  theme_minimal() +
+  guides(color = "none") +
+  labs(
+    title = "Parameter Traces (Filtered)",
+    x = "Iteration", y = "Parameter Value"
+  )
+
+# Compute log-likelihood via pfilter
+local_search <- foreach(mf = mifs_local, .combine = rbind) %dorng% {
+  ll_evals <- replicate(50, logLik(pfilter(mf, Np = 5000)))
+  ll <- logmeanexp(ll_evals, se = TRUE)
+  coef(mf) %>% bind_rows() %>%
+    bind_cols(loglik = ll[1], loglik.se = ll[2])
+}
+
+# Filter and summarize
+best_searches <- local_search %>%
+  filter(is.finite(loglik)) %>%
+  filter(loglik.se < 0.5) %>%
+  arrange(desc(loglik))
+
+head(best_searches)
+summary(best_searches$loglik)
+
+orange_obs_long <- orange_rel %>%
+  pivot_longer(cols = c(algae, flagellates, rotifers),
+               names_to = "species",
+               values_to = "obs") %>%
+  mutate(type = "Observed")
+
+orange_obs_long <- orange_obs_long %>%
+  rename(abundance = obs)
+
+simulated_data <- simulate(
+  pomp_model,
+  params = unlist(best_searches[1,]),
+  nsim = 1,
+  format = "data.frame",
+  include.data = TRUE
+)
+
+sim_df <- as.data.frame(simulated_data, include.data = TRUE)
+
+sim_long <- sim_df %>%
+  mutate(
+    A = A / maxA,
+    R = R / maxR,
+    F = F / maxF
+  ) %>%
+  pivot_longer(cols = c(A, R, F),
+               names_to = "species",
+               values_to = "log_abundance") %>%
+  mutate(
+    abundance = pmax(log_abundance, 1e-6),
+    species = recode(species,
+                     A = "algae",
+                     R = "rotifers",
+                     F = "flagellates"),
+    type = "Simulated"
+  )
+
+sim_long <- sim_long %>%
+  filter(!is.na(abundance), is.finite(abundance), abundance >= 0, abundance <= 1)
+
+combined_data <- bind_rows(orange_obs_long, sim_long)
+
+ggplot(combined_data, aes(x = day, y = abundance, color = species, shape = species)) +
+  geom_point(data = filter(combined_data, type == "Observed"), size = 2, alpha = 0.8) +
+  geom_line(data = filter(combined_data, type == "Simulated"), linewidth = 1) +
+  scale_color_manual(values = c(
+    algae = "green4", flagellates = "purple", rotifers = "red"
+  )) +
+  scale_shape_manual(values = c(
+    algae = 16, flagellates = 17, rotifers = 15
+  )) +
+  labs(
+    title = "POMP Simulation vs. Observed Data",
+    x = "Day",
+    y = "Abundance (log scale)",
+    color = "Species",
+    shape = "Species"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+
+```
+
+
+```{r global_search}
+library(doFuture)
+library(iterators)
+plan(multisession)
+library(purrr)
+
+
+# Full parameter list including scaling factors
+paramnames <- c(
+  "delta", "kA", "kR", "r", "g", "h",
+  "alphaA", "alphaF", "eta", "IF",
+  "S_0", "A_0", "R_0", "F_0",
+  "maxA", "maxF", "maxR"
+)
+
+# Step 1: define narrowed random parameter ranges
+best_param <- coef(mifs_local[[1]])
+param_range <- runif_design(
+  lower = best_param * 0.5,
+  upper = best_param * 1.5,
+  nseq = 100
+)
+
+
+# Step 2: pick a starting mif2 object from local search
+mf_start <- mifs_local[[1]]
+
+# Step 3: Run mif2 for each random parameter set
+bake(file = "mif2_global.rds", seed = 888888, {
+  foreach(p = iter(param_range, "row"), .combine = c,
+          .options.future = list(seed = TRUE)) %dofuture% {
+    mif2(
+      mf_start,
+      Nmif = 200,
+      params = unlist(p),
+      Np = 1000,
+      cooling.fraction.50 = 0.5,
+      rw.sd = rw_sd_values
+    )
+  }
+}) -> mif2_results
+
+# Step 4: Evaluate log-likelihoods
+bake(file = "pfilter_ll.rds", seed = 999999, {
+  foreach(m = mif2_results, .combine = rbind,
+          .options.future = list(seed = TRUE)) %dofuture% {
+    replicate(20, logLik(pfilter(m, Np = 5000))) |>
+      logmeanexp(se = TRUE)
+  }
+}) -> loglik_results
+
+# Step 5: Combine and sort
+mif2_params <- map_dfr(mif2_results, coef)
+
+mif2_global_summary <- mif2_params %>%
+  bind_cols(
+    loglik = loglik_results[, 1],
+    loglik.se = loglik_results[, 2]
+  ) %>%
+  arrange(desc(loglik))
+
+# Step 6: Filter good results
+best_searches <- mif2_global_summary %>%
+  filter(is.finite(loglik), loglik.se < 0.5) %>%
+  arrange(-loglik)
+
+head(best_searches)
+summary(best_searches$loglik)
+
+# Simulate best
+params <- best_searches[1, paramnames] |> unlist()
+
+simulated_data <- simulate(
+  pomp_model,
+  params = params,
+  nsim = 1,
+  format = "data.frame",
+  include.data = TRUE
+)
+
+summary(simulated_data)
+
+sim_df <- as.data.frame(simulated_data, include.data = FALSE)
+
+# Standardize simulation to match measurement model
+sim_long <- sim_df %>%
+  mutate(
+    A = A / maxA,
+    R = R / maxR,
+    F = F / maxF
+  ) %>%
+  pivot_longer(cols = c(A, R, F),
+               names_to = "species",
+               values_to = "rel_abundance") %>%
+  mutate(
+    species = recode(species,
+                     A = "algae",
+                     R = "rotifers",
+                     F = "flagellates"),
+    type = "Simulated"
+  )
+
+# Combine and plot
+obs_long <- orange_rel %>%
+  pivot_longer(cols = c(algae, flagellates, rotifers),
+               names_to = "species",
+               values_to = "rel_abundance") %>%
+  mutate(type = "Observed")
+
+combined_data <- bind_rows(obs_long, sim_long)
+
+ggplot(combined_data, aes(x = day, y = rel_abundance, color = species)) +
+  geom_point(data = filter(combined_data, type == "Observed"),
+             aes(shape = species), size = 2, alpha = 0.8) +
+  geom_line(data = filter(combined_data, type == "Simulated"),
+            linewidth = 1) +
+  scale_color_manual(values = c(
+    algae = "green4",
+    flagellates = "purple",
+    rotifers = "red"
+  )) +
+  scale_shape_manual(values = c(
+    algae = 16, flagellates = 17, rotifers = 15
+  )) +
+  labs(
+    title = "Global Search: POMP Simulation vs Observed",
+    x = "Day",
+    y = "Relative Abundance",
+    color = "Species",
+    shape = "Species"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+```
+
+
